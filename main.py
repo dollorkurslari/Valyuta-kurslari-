@@ -75,6 +75,22 @@ def wait_until_exact(hour, minute=0, max_late_minutes=120):
     return True
 
 
+def parse_price(matn):
+    """Narx matnini songa aylantiradi, kasr qismini (nuqta/vergul) HISOBGA OLADI.
+    '11 887.37 so'm' -> 11887 ;  '11 850 so'm' -> 11850 ;  '11 887,37' -> 11887.
+    (Avval nuqta tashlab yuborilib, '11 887.37' -> 1188737 bo'lib qolardi — Openbank xatosi.)"""
+    if not matn:
+        return 0
+    t = str(matn).replace("\u00a0", " ")
+    m = re.search(r"\d[\d ]*(?:[.,]\d+)?", t)
+    if not m:
+        return 0
+    try:
+        return int(round(float(m.group(0).replace(" ", "").replace(",", "."))))
+    except ValueError:
+        return 0
+
+
 def tozalash(matn):
     """Matndan faqat raqamlarni ajratib oladi."""
     if not matn:
@@ -226,14 +242,20 @@ def get_all_bank_rates():
 
     def extract_bank_value(a_tag, full_html):
         """Bitta bank narxini TOPISH UCHUN 3 TA USUL bilan urinadi.
-        1-usul ishlamasa 2-usulni, u ham ishlamasa 3-usulni sinaydi.
+        Har bir topilgan qiymat 5 000 - 30 000 so'm oralig'ida bo'lishi shart
+        (1 dollar uchun mantiqiy narx); aks holda keyingi usulga o'tiladi.
         Uchalasi ham muvaffaqiyatsiz bo'lsagina None qaytaradi (bank o'tkazib yuboriladi)."""
+
+        def togri(v):
+            return 5000 <= v <= 30000
+
+        narx_re = r"(\d[\d\s\u00a0]*(?:[.,]\d+)?)\s*so'm"
 
         # 1-urinish: elementdan keyingi eng yaqin "so'm" so'zini qidirish
         try:
             price_node = a_tag.find_next(string=re.compile(r"so'm"))
-            val = tozalash(price_node)
-            if val > 0:
+            val = parse_price(price_node)
+            if togri(val):
                 return val
         except Exception:
             pass
@@ -242,12 +264,9 @@ def get_all_bank_rates():
         try:
             parent = a_tag.find_parent()
             if parent:
-                matn = parent.get_text(" ", strip=True)
-                m = re.search(r"([\d\s]{3,})\s*so'm", matn)
-                if m:
-                    val = tozalash(m.group(1))
-                    if val > 0:
-                        return val
+                m = re.search(narx_re, parent.get_text(" ", strip=True))
+                if m and togri(parse_price(m.group(1))):
+                    return parse_price(m.group(1))
         except Exception:
             pass
 
@@ -255,12 +274,9 @@ def get_all_bank_rates():
         try:
             idx = full_html.find(str(a_tag))
             if idx != -1:
-                keyingi_qism = full_html[idx: idx + 400]
-                m = re.search(r"([\d\s]{3,})\s*so'm", keyingi_qism)
-                if m:
-                    val = tozalash(m.group(1))
-                    if val > 0:
-                        return val
+                m = re.search(narx_re, full_html[idx: idx + 400])
+                if m and togri(parse_price(m.group(1))):
+                    return parse_price(m.group(1))
         except Exception:
             pass
 
@@ -603,7 +619,7 @@ def run_send(target_hour=None, fetch_first=False):
     if skipped:
         xabar += f"\n<i>⚠️ Ushbu banklar o'tkazib yuborildi: {', '.join(skipped)}</i>\n"
 
-    xabar += f"\n🕒 <b>Yangilandi:</b> @@VAQT@@\n📢 @dollarkursiuzz"
+    xabar += f"\n🕒 <b>Yangilandi:</b> @@VAQT@@\n📢 @dollorkurslariUZ"
 
     # server rejimi: ma'lumot oldindan olingan, endi aniq soniyagacha kutib yuboramiz
     if target_hour is not None and fetch_first:
