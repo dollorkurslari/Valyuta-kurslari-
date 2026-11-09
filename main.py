@@ -1062,9 +1062,17 @@ def handle_private_message(msg):
     user_id = msg.get("from", {}).get("id", chat_id)
     text = (msg.get("text") or "").strip()
 
+    if re.match(r"/id\b", text):
+        tg_send(chat_id, f"Sizning Telegram ID'ingiz: <code>{user_id}</code>")
+        return
+
     if re.match(r"/(statistika|stats?|statistics)\b", text):
         if OWNER_ID and str(user_id) == str(OWNER_ID):      # faqat egasiga ko'rsatiladi
             tg_send(chat_id, stats_text(), reply_markup=KEYBOARD)
+        elif not OWNER_ID:
+            tg_send(chat_id, "⚠️ OWNER_ID sozlanmagan. Railway → Variables ga OWNER_ID qo'shing.")
+        else:
+            tg_send(chat_id, f"Bu buyruq faqat bot egasi uchun. Sizning ID: <code>{user_id}</code>")
         return
 
     if text.startswith("/start") or text.startswith("/help"):
