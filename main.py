@@ -3,6 +3,7 @@ import re
 import sys
 import json
 import math
+import threading
 import html as htmllib
 import time
 import datetime
@@ -77,7 +78,7 @@ def wait_until_exact(hour, minute=0, max_late_minutes=120):
     return True
 
 
-def parse_price(matn):
+def parse_price(matn, decimals=False):
     """Narx matnini songa aylantiradi, kasr qismini (nuqta/vergul) HISOBGA OLADI.
     '11 887.37 so'm' -> 11887 ;  '11 850 so'm' -> 11850 ;  '11 887,37' -> 11887.
     (Avval nuqta tashlab yuborilib, '11 887.37' -> 1188737 bo'lib qolardi — Openbank xatosi.)"""
@@ -88,7 +89,8 @@ def parse_price(matn):
     if not m:
         return 0
     try:
-        return int(round(float(m.group(0).replace(" ", "").replace(",", "."))))
+        v = float(m.group(0).replace(" ", "").replace(",", "."))
+        return round(v, 2) if decimals else int(round(v))
     except ValueError:
         return 0
 
@@ -101,12 +103,15 @@ def tozalash(matn):
     return int(toza_son) if toza_son else 0
 
 
+TG_SESSION = requests.Session()   # Telegramga ulanishni qayta ishlatamiz (tezroq)
+
+
 def tg_send(chat_id, text, parse_mode="HTML", reply_markup=None):
     data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode,
             "disable_web_page_preview": True}
     if reply_markup is not None:
         data["reply_markup"] = json.dumps(reply_markup)
-    resp = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data=data)
+    resp = TG_SESSION.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data=data, timeout=15)
     if resp.status_code != 200:
         print(f"❌ Telegram xatosi ({chat_id}): {resp.text}")
     return resp
@@ -209,14 +214,22 @@ def fetch_bankuz_html():
     raise RuntimeError("bank.uz ga hech qaysi usul bilan yetib bo'lmadi -> " + " | ".join(xatolar))
 
 
-def get_all_bank_rates():
+CURRENCY_RANGE = {"USD": (5000, 30000), "RUB": (10, 1000)}   # 1 birlik uchun mantiqiy narx oralig'i (so'm)
+
+
+def parse_bank_rates(html_text, code="USD", usul="?"):
+    """bank.uz sahifasidan berilgan valyuta (USD yoki RUB) bo'yicha banklar kursini ajratib oladi."""
     from bs4 import BeautifulSoup  # faqat shu funksiya chaqirilganda kerak
 
-    html_text, usul = fetch_bankuz_html()
-    print(f"✅ bank.uz sahifasi '{usul}' usuli bilan olindi ({len(html_text)} belgi).")
+    lo, hi = CURRENCY_RANGE[code]
+    decimals = code != "USD"
     soup = BeautifulSoup(html_text, "html.parser")
 
-    container = soup.find(id="best_USD") or soup
+    container = soup.find(id=f"best_{code}")
+    if container is None:
+        if code != "USD":
+            raise ValueError(f"bank.uz sahifasida {code} bloki topilmadi")
+        container = soup
     html = str(container)
 
     # ">Sotish<" — orasida bo'sh joy/yangi qator bo'lishi mumkin, shuning uchun
@@ -249,14 +262,14 @@ def get_all_bank_rates():
         Uchalasi ham muvaffaqiyatsiz bo'lsagina None qaytaradi (bank o'tkazib yuboriladi)."""
 
         def togri(v):
-            return 5000 <= v <= 30000
+            return lo <= v <= hi
 
         narx_re = r"(\d[\d\s\u00a0]*(?:[.,]\d+)?)\s*so'm"
 
         # 1-urinish: elementdan keyingi eng yaqin "so'm" so'zini qidirish
         try:
             price_node = a_tag.find_next(string=re.compile(r"so'm"))
-            val = parse_price(price_node)
+            val = parse_price(price_node, decimals)
             if togri(val):
                 return val
         except Exception:
@@ -267,8 +280,8 @@ def get_all_bank_rates():
             parent = a_tag.find_parent()
             if parent:
                 m = re.search(narx_re, parent.get_text(" ", strip=True))
-                if m and togri(parse_price(m.group(1))):
-                    return parse_price(m.group(1))
+                if m and togri(parse_price(m.group(1), decimals)):
+                    return parse_price(m.group(1), decimals)
         except Exception:
             pass
 
@@ -277,8 +290,8 @@ def get_all_bank_rates():
             idx = full_html.find(str(a_tag))
             if idx != -1:
                 m = re.search(narx_re, full_html[idx: idx + 400])
-                if m and togri(parse_price(m.group(1))):
-                    return parse_price(m.group(1))
+                if m and togri(parse_price(m.group(1), decimals)):
+                    return parse_price(m.group(1), decimals)
         except Exception:
             pass
 
@@ -321,6 +334,12 @@ def get_all_bank_rates():
 
     banks.sort(key=lambda r: r["buy_num"], reverse=True)
     return banks, skipped
+
+
+def get_all_bank_rates(code="USD"):
+    html_text, usul = fetch_bankuz_html()
+    print(f"✅ bank.uz sahifasi '{usul}' usuli bilan olindi ({len(html_text)} belgi).")
+    return parse_bank_rates(html_text, code, usul)
 
 
 # ============================================================
@@ -622,7 +641,7 @@ def run_send(target_hour=None, fetch_first=False):
     if skipped:
         xabar += f"\n<i>⚠️ Ushbu banklar o'tkazib yuborildi: {', '.join(skipped)}</i>\n"
 
-    xabar += f"\n🕒 <b>Yangilandi:</b> @@VAQT@@\n📢 @dollarkursiuzz"
+    xabar += f"\n🕒 <b>Yangilandi:</b> @@VAQT@@\n📢 @dollorkurslariUZ"
 
     # server rejimi: ma'lumot oldindan olingan, endi aniq soniyagacha kutib yuboramiz
     if target_hour is not None and fetch_first:
@@ -644,51 +663,97 @@ def run_send(target_hour=None, fetch_first=False):
 
 
 # ============================================================
-# BOT: /start, tugmalar va hisoblagich (dollar <-> so'm)
+# BOT: /start, tugmalar, hisoblagich (dollar, rubl <-> so'm) va kurs xabarnomalari
 # ============================================================
 CHANNEL_USERNAME = "@dollarkursiuzz"
+CHANNEL_URL = "https://t.me/dollarkursiuzz"
 BTN_USD = "💵 Dollar → So'm"
 BTN_UZS = "💰 So'm → Dollar"
+BTN_RUB = "🇷🇺 Rubl → So'm"
+BTN_UZS_RUB = "💰 So'm → Rubl"
+BTN_ALERT = "🔔 Xabarnoma"
+BTN_CHANNEL = "📢 Kanal"
 KEYBOARD = {
-    "keyboard": [[{"text": BTN_USD}, {"text": BTN_UZS}]],
+    "keyboard": [
+        [{"text": BTN_USD}, {"text": BTN_UZS}],
+        [{"text": BTN_RUB}, {"text": BTN_UZS_RUB}],
+        [{"text": BTN_ALERT}, {"text": BTN_CHANNEL}],
+    ],
     "resize_keyboard": True,
     "is_persistent": True,
 }
 
 USER_STATE = {}                          # foydalanuvchi qaysi tugmani bosgani (xotirada)
-RATES_CACHE = {"ts": 0.0, "banks": None}
+RATES_CACHE = {}                         # {"USD": {"ts":..., "banks":[...]}, "RUB": {...}}
 RATES_CACHE_TTL = 600                    # kurslarni 10 daqiqa eslab turamiz
 
+# kind -> (valyuta kodi, nomi, belgisi, yo'nalishi)
+CONVERT = {
+    "usd":     ("USD", "dollar", "💵", "to_uzs"),
+    "uzs":     ("USD", "dollar", "💰", "from_uzs"),
+    "rub":     ("RUB", "rubl",   "🇷🇺", "to_uzs"),
+    "uzs_rub": ("RUB", "rubl",   "💰", "from_uzs"),
+}
 
-def set_rates_cache(banks):
-    RATES_CACHE["ts"] = time.time()
-    RATES_CACHE["banks"] = banks
+# xabarnomalar (kurs ma'lum darajaga yetganda xabar berish)
+# Doimiy saqlash uchun Railway Volume ulab, DATA_DIR=/data qiling; bo'lmasa qayta ishga tushganda tozalanadi.
+ALERTS_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "alerts.json")
+MAX_ALERTS_PER_USER = 3
+MAX_ALERT_USERS = 1000
 
 
-def get_rates_for_converter():
-    """(banklar, necha_daqiqa_oldin) qaytaradi. Yangi bo'lmasa bank.uz dan qayta oladi.
-    Hech narsa olib bo'lmasa (None, None)."""
-    now = time.time()
-    if RATES_CACHE["banks"] and now - RATES_CACHE["ts"] < RATES_CACHE_TTL:
-        return RATES_CACHE["banks"], int((now - RATES_CACHE["ts"]) // 60)
+def set_rates_cache(banks, code="USD"):
+    RATES_CACHE[code] = {"ts": time.time(), "banks": banks}
+
+
+BACKGROUND_REFRESH = False       # scheduler.py True qiladi: kurslarni fonda o'zi yangilab turadi
+STALE_OK_SECONDS = 3600          # fon yangilash bor bo'lsa, 1 soatgacha eski kursni ham ishlatamiz (kutdirmaslik uchun)
+
+
+def refresh_rates_cache():
+    """bank.uz dan USD va RUB kurslarini olib, keshni yangilaydi. True — kamida USD yangilandi."""
     try:
-        banks, _ = get_all_bank_rates()
-        if len(banks) >= 5:
-            set_rates_cache(banks)
-            return banks, 0
+        html_text, usul = fetch_bankuz_html()
     except Exception as e:
-        print(f"⚠️ Hisoblagich uchun kurs olib bo'lmadi: {str(e)[:150]}")
-    if RATES_CACHE["banks"]:
-        return RATES_CACHE["banks"], int((now - RATES_CACHE["ts"]) // 60)
+        print(f"⚠️ Kurslarni yangilab bo'lmadi: {str(e)[:150]}")
+        return False
+    ok = False
+    for cc, kam in (("USD", 5), ("RUB", 3)):
+        try:
+            banks, _ = parse_bank_rates(html_text, cc, usul)
+            if len(banks) >= kam:
+                set_rates_cache(banks, cc)
+                ok = ok or cc == "USD"
+        except Exception as e:
+            print(f"⚠️ {cc} kurslarini o'qib bo'lmadi: {str(e)[:120]}")
+    return ok
+
+
+def get_rates_for_converter(code="USD"):
+    """(banklar, necha_daqiqa_oldin) qaytaradi. Hech narsa bo'lmasa (None, None).
+    Fon yangilash yoqilgan bo'lsa (Railway), foydalanuvchini kutdirmaydi: keshdagini darhol beradi."""
+    now = time.time()
+    c = RATES_CACHE.get(code)
+    chegara = STALE_OK_SECONDS if BACKGROUND_REFRESH else RATES_CACHE_TTL
+    if c and now - c["ts"] < chegara:
+        return c["banks"], int((now - c["ts"]) // 60)
+    refresh_rates_cache()
+    c = RATES_CACHE.get(code)
+    if c:
+        return c["banks"], int((time.time() - c["ts"]) // 60)
     return None, None
 
 
 def detect_kind(text):
-    """Matndan nima hisoblash kerakligini aniqlaydi: 'usd' ($ -> so'm) yoki 'uzs' (so'm -> $)."""
+    """Matndan nima hisoblash kerakligini aniqlaydi: 'usd', 'uzs' (so'm -> dollar),
+    'rub' (rubl -> so'm), 'uzs_rub' (so'm -> rubl) yoki None."""
     t = text.lower()
+    som = bool(re.search(r"so['‘’`]?m|\bsum\b|ming|\bmin\b|mln|million|milyon|uzs", t))
+    if "₽" in t or re.search(r"rubl|\brub\b|rur|рубл", t):
+        return "uzs_rub" if som else "rub"
     if "$" in t or re.search(r"dollar|dollor|usd", t):
         return "usd"
-    if re.search(r"so['‘’`]?m|\bsum\b|ming|\bmin\b|mln|million|milyon|uzs", t):
+    if som:
         return "uzs"
     return None
 
@@ -724,83 +789,338 @@ def _fmt(n):
     return f"{int(n):,}".replace(",", " ")
 
 
+def _fmt_rate(v):
+    return _fmt(v) if float(v).is_integer() else f"{v:,.2f}".replace(",", " ")
+
+
 def _fmt_amount(v):
     return _fmt(v) if float(v).is_integer() else f"{v:.2f}".rstrip("0").rstrip(".")
 
 
 def convert_reply(kind, amount):
-    """Hisoblash natijasi matni (HTML). Dollar -> so'm: eng YUQORI xarid kursi.
-    So'm -> dollar: eng PAST sotuv kursi."""
-    banks, yosh = get_rates_for_converter()
+    """Hisoblash natijasi (HTML): eng yaxshi bank VA eng past bank, farqi, kanal eslatmasi.
+    Valyuta -> so'm: yuqori xarid kursi yaxshi. So'm -> valyuta: past sotuv kursi yaxshi."""
+    code, nom, belgi, yonalish = CONVERT[kind]
+    banks, yosh = get_rates_for_converter(code)
     if not banks:
         return "😔 Hozir bank kurslarini ola olmadim. Birozdan keyin qayta urinib ko'ring."
 
     yangilik = "🕒 Kurslar hozirgina olindi" if yosh == 0 else f"🕒 Kurslar {yosh} daqiqa oldin olingan"
+    kanal = f"📢 Kunlik kurslar va quyma oltin narxlarini {CHANNEL_USERNAME} kanalimizdan bilib olasiz."
 
-    if kind == "usd":
-        b = max(banks, key=lambda r: r["buy_num"])
-        jami = round(amount * b["buy_num"])
-        return (f"💵 <b>{_fmt_amount(amount)} dollar</b> = <b>{_fmt(jami)} so'm</b>\n\n"
-                f"🏦 Bank: <b>{htmllib.escape(b['name'])}</b> (eng yuqori xarid kursi)\n"
-                f"📈 Kurs: 1 dollar = {_fmt(b['buy_num'])} so'm\n\n"
-                f"<i>Bank dollaringizni shu kurs bo'yicha sotib oladi.</i>\n{yangilik}")
+    if yonalish == "to_uzs":
+        yaxshi = max(banks, key=lambda r: r["buy_num"])
+        past = min(banks, key=lambda r: r["buy_num"])
+        j_yaxshi = round(amount * yaxshi["buy_num"])
+        j_past = round(amount * past["buy_num"])
+        sarlavha = f"{belgi} <b>{_fmt_amount(amount)} {nom}</b> = <b>{_fmt(j_yaxshi)} so'm</b>"
+        qator_y = (f"🏦 <b>Eng yaxshi: {htmllib.escape(yaxshi['name'])}</b>\n"
+                   f"📈 1 {nom} = {_fmt_rate(yaxshi['buy_num'])} so'm → <b>{_fmt(j_yaxshi)} so'm</b>")
+        qator_p = (f"⚠️ <b>Eng past: {htmllib.escape(past['name'])}</b>\n"
+                   f"📉 1 {nom} = {_fmt_rate(past['buy_num'])} so'm → {_fmt(j_past)} so'm")
+        farq = f"💡 Farq: <b>{_fmt(j_yaxshi - j_past)} so'm</b>"
+        izoh = f"<i>Bank {nom}ingizni shu kurs bo'yicha sotib oladi.</i>"
+    else:
+        yaxshi = min(banks, key=lambda r: r["sell_num"])
+        past = max(banks, key=lambda r: r["sell_num"])
+        o_yaxshi = math.floor(amount / yaxshi["sell_num"] * 100) / 100
+        o_past = math.floor(amount / past["sell_num"] * 100) / 100
+        sarlavha = f"{belgi} <b>{_fmt_amount(amount)} so'm</b> = <b>{o_yaxshi:.2f} {nom}</b>"
+        qator_y = (f"🏦 <b>Eng yaxshi: {htmllib.escape(yaxshi['name'])}</b>\n"
+                   f"📉 1 {nom} = {_fmt_rate(yaxshi['sell_num'])} so'm → <b>{o_yaxshi:.2f} {nom}</b>")
+        qator_p = (f"⚠️ <b>Eng past: {htmllib.escape(past['name'])}</b>\n"
+                   f"📈 1 {nom} = {_fmt_rate(past['sell_num'])} so'm → {o_past:.2f} {nom}")
+        farq = f"💡 Farq: <b>{o_yaxshi - o_past:.2f} {nom}</b>"
+        izoh = f"<i>Bank sizga {nom}ni shu kurs bo'yicha sotadi.</i>"
 
-    b = min(banks, key=lambda r: r["sell_num"])
-    dollar = math.floor(amount / b["sell_num"] * 100) / 100
-    return (f"💰 <b>{_fmt_amount(amount)} so'm</b> = <b>{dollar:.2f} dollar</b>\n\n"
-            f"🏦 Bank: <b>{htmllib.escape(b['name'])}</b> (eng arzon sotuv kursi)\n"
-            f"📉 Kurs: 1 dollar = {_fmt(b['sell_num'])} so'm\n\n"
-            f"<i>Bank sizga dollarni shu kurs bo'yicha sotadi.</i>\n{yangilik}")
+    return f"{sarlavha}\n\n{qator_y}\n\n{qator_p}\n\n{farq}\n{izoh}\n\n{kanal}\n{yangilik}"
+
+
+# ---------------- xabarnomalar ----------------
+def load_alerts():
+    try:
+        with open(ALERTS_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_alerts(d):
+    try:
+        papka = os.path.dirname(ALERTS_FILE)
+        if papka:
+            os.makedirs(papka, exist_ok=True)
+        with open(ALERTS_FILE, "w") as f:
+            json.dump(d, f)
+        return True
+    except OSError as e:
+        print(f"⚠️ Xabarnomalarni saqlab bo'lmadi: {e}")
+        return False
+
+
+def has_alerts():
+    return bool(load_alerts())
+
+
+def alert_text(a):
+    if a["type"] == "up":
+        return f"dollar eng yuqori xarid kursi {_fmt(a['x'])} so'mga yetganda"
+    return f"dollar eng arzon sotuv kursi {_fmt(a['x'])} so'mga tushganda"
+
+
+def add_alert(user_id, chat_id, x, banks):
+    """Xabarnoma qo'shadi. Qaytaradi: (matn, muvaffaqiyatmi)."""
+    best_buy = max(r["buy_num"] for r in banks)
+    best_sell = min(r["sell_num"] for r in banks)
+    tur = "up" if x > (best_buy + best_sell) / 2 else "down"
+    a = {"type": tur, "x": int(x), "chat": chat_id}
+
+    data = load_alerts()
+    mine = data.get(str(user_id), [])
+    if any(o["type"] == a["type"] and o["x"] == a["x"] for o in mine):
+        return "Bu xabarnoma allaqachon qo'yilgan.", False
+    if len(mine) >= MAX_ALERTS_PER_USER:
+        return (f"Eng ko'pi bilan {MAX_ALERTS_PER_USER} ta xabarnoma qo'yish mumkin. "
+                "Avval \"o'chirish\" deb yozib, eskilarini tozalang."), False
+    if str(user_id) not in data and len(data) >= MAX_ALERT_USERS:
+        return "Hozircha xabarnomalar to'lib qolgan, keyinroq urinib ko'ring.", False
+    mine.append(a)
+    data[str(user_id)] = mine
+    if not save_alerts(data):
+        return "Xabarnomani saqlab bo'lmadi, keyinroq urinib ko'ring.", False
+    hozir = (f"hozir eng yuqori xarid {_fmt(best_buy)}" if tur == "up"
+             else f"hozir eng arzon sotuv {_fmt(best_sell)}")
+    return f"✅ {alert_text(a).capitalize()} xabar beraman ({hozir} so'm).", True
+
+
+def check_alerts(banks):
+    """Barcha xabarnomalarni joriy kurslar bilan solishtiradi; yetganlariga xabar yuboradi."""
+    data = load_alerts()
+    if not data:
+        return
+    bb = max(banks, key=lambda r: r["buy_num"])
+    bs = min(banks, key=lambda r: r["sell_num"])
+    o_zgardi = False
+    for uid, lst in list(data.items()):
+        qolgan = []
+        for a in lst:
+            if a["type"] == "up" and bb["buy_num"] >= a["x"]:
+                matn = (f"🔔 Dollar kursi ko'tarildi!\n\n"
+                        f"📈 Eng yuqori xarid kursi: <b>{_fmt(bb['buy_num'])} so'm</b> — "
+                        f"{htmllib.escape(bb['name'])}\n(siz kutgan daraja: {_fmt(a['x'])})")
+            elif a["type"] == "down" and bs["sell_num"] <= a["x"]:
+                matn = (f"🔔 Dollar kursi tushdi!\n\n"
+                        f"📉 Eng arzon sotuv kursi: <b>{_fmt(bs['sell_num'])} so'm</b> — "
+                        f"{htmllib.escape(bs['name'])}\n(siz kutgan daraja: {_fmt(a['x'])})")
+            else:
+                qolgan.append(a)
+                continue
+            o_zgardi = True
+            try:
+                r = tg_send(a["chat"], matn)
+                if r.status_code in (400, 403):      # foydalanuvchi botni bloklagan
+                    qolgan = []
+                    break
+            except Exception as e:
+                print(f"⚠️ Xabarnomani yuborib bo'lmadi: {str(e)[:100]}")
+                qolgan.append(a)
+        if qolgan:
+            data[uid] = qolgan
+        else:
+            data.pop(uid, None)
+    if o_zgardi:
+        save_alerts(data)
+
+
+# ---------------- statistika (faqat egasi uchun) ----------------
+STATS_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "stats.json")
+_STATS_LOCK = threading.Lock()
+
+
+def _load_stats():
+    try:
+        with open(STATS_FILE) as f:
+            d = json.load(f)
+        if isinstance(d, dict) and "users" in d:
+            return d
+    except (FileNotFoundError, ValueError):
+        pass
+    return {"since": time.time(), "users": {}, "conv": {}}
+
+
+def record_stat(user_id, event, kind=None):
+    """Foydalanuvchi harakatini sanaydi (faqat ID va sonlar, ism/xabar saqlanmaydi).
+    Egasining (OWNER_ID) o'z harakatlari sanalmaydi."""
+    if OWNER_ID and str(user_id) == str(OWNER_ID):
+        return
+    try:
+        with _STATS_LOCK:
+            d = _load_stats()
+            now = time.time()
+            u = d["users"].setdefault(str(user_id), {"first": now, "last": now, "n": 0})
+            u["last"] = now
+            if event == "conv":
+                u["n"] = u.get("n", 0) + 1
+                d["conv"][kind] = d["conv"].get(kind, 0) + 1
+            elif event == "alert":
+                u["alert"] = u.get("alert", 0) + 1
+            with open(STATS_FILE, "w") as f:
+                json.dump(d, f)
+    except Exception as e:
+        print(f"⚠️ Statistikani saqlab bo'lmadi: {str(e)[:100]}")
+
+
+def stats_text():
+    with _STATS_LOCK:
+        d = _load_stats()
+    users = d["users"]
+    now = tashkent_now()
+    bugun = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    hafta = time.time() - 7 * 86400
+    jami = len(users)
+    hisoblagan = sum(1 for u in users.values() if u.get("n", 0) > 0)
+    conv = d.get("conv", {})
+    dollar = conv.get("usd", 0) + conv.get("uzs", 0)
+    rubl = conv.get("rub", 0) + conv.get("uzs_rub", 0)
+    alerts = load_alerts()
+    n_alert = sum(len(v) for v in alerts.values())
+    since = datetime.datetime.fromtimestamp(d.get("since", time.time()), UZ_TZ).strftime("%d.%m.%Y")
+    return (
+        "📊 <b>Bot statistikasi</b>\n\n"
+        f"👥 Start bosganlar: <b>{jami}</b> kishi\n"
+        f"🔄 Hisoblaganlar: <b>{hisoblagan}</b> kishi (jami <b>{dollar + rubl}</b> marta)\n"
+        f"   💵 Dollar: {dollar} marta | 🇷🇺 Rubl: {rubl} marta\n"
+        f"🔔 Xabarnomalar: <b>{len(alerts)}</b> kishi, {n_alert} ta\n\n"
+        f"📅 Bugun: yangi <b>{sum(1 for u in users.values() if u['first'] >= bugun)}</b>, "
+        f"faol <b>{sum(1 for u in users.values() if u['last'] >= bugun)}</b>\n"
+        f"📆 So'nggi 7 kun faol: <b>{sum(1 for u in users.values() if u['last'] >= hafta)}</b>\n\n"
+        f"<i>Hisob {since} dan boshlangan (oldingi foydalanuvchilar sanalmagan).</i>"
+    )
 
 
 def welcome_text(first_name):
     ism = htmllib.escape(first_name or "do'stim")
     return (f"👋 Assalomu alaykum, <b>{ism}</b>!\n\n"
-            "Men O'zbekiston banklaridagi dollar kurslarini kuzatib boradigan botman.\n\n"
+            "Men O'zbekiston banklaridagi dollar va rubl kurslarini kuzatib boradigan botman.\n\n"
             "<b>Nimalar qila olaman:</b>\n"
             "💵 <b>Dollar → So'm</b>: dollaringizni so'mga hisoblab beraman va "
             "eng yuqori narx beradigan bankni ko'rsataman\n"
             "💰 <b>So'm → Dollar</b>: so'mingizga necha dollar olishingizni hisoblab beraman va "
-            "eng arzon sotadigan bankni ko'rsataman\n\n"
+            "eng arzon sotadigan bankni ko'rsataman\n"
+            "🇷🇺 <b>Rubl</b> uchun ham xuddi shunday hisoblab beraman\n"
+            "🔔 <b>Xabarnoma</b>: dollar siz kutgan kursga yetganda xabar beraman\n\n"
             f"📢 {CHANNEL_USERNAME} kanalida kunlik dollar kurslari va quyma oltin narxlari "
             "har kuni yangilanib turadi.\n\n"
             "Quyidagi tugmalardan birini tanlang 👇")
 
 
+def _alert_prompt(user_id):
+    banks, yosh = get_rates_for_converter("USD")
+    qator = ""
+    if banks:
+        qator = (f"\nHozir: eng yuqori xarid <b>{_fmt(max(r['buy_num'] for r in banks))}</b>, "
+                 f"eng arzon sotuv <b>{_fmt(min(r['sell_num'] for r in banks))}</b> so'm.\n")
+    mavjud = load_alerts().get(str(user_id), [])
+    royxat = ""
+    if mavjud:
+        royxat = "\n<b>Sizning xabarnomalaringiz:</b>\n" + "\n".join(f"• {alert_text(a)}" for a in mavjud) + "\n"
+    return ("🔔 <b>Dollar kursi xabarnomasi</b>\n"
+            "1 dollar uchun so'mni yozing, masalan: <b>12100</b>\n"
+            "Hozirgi kursdan yuqori yozsangiz — ko'tarilganda, past yozsangiz — tushganda xabar beraman."
+            f"{qator}{royxat}\nHammasini o'chirish uchun <b>o'chirish</b> deb yozing.")
+
+
+def handle_alert_input(chat_id, user_id, text):
+    t = text.lower().replace("‘", "'").replace("’", "'")
+    if re.search(r"o'?chir", t):
+        data = load_alerts()
+        data.pop(str(user_id), None)
+        save_alerts(data)
+        tg_send(chat_id, "🗑 Xabarnomalaringiz o'chirildi.", reply_markup=KEYBOARD)
+        return
+    x = parse_amount(text)
+    if x is None or not (5000 <= x <= 30000):
+        tg_send(chat_id, "1 dollar uchun so'mni yozing, masalan: <b>12100</b>", reply_markup=KEYBOARD)
+        return
+    banks, yosh = get_rates_for_converter("USD")
+    if not banks:
+        tg_send(chat_id, "😔 Hozir bank kurslarini ola olmadim. Birozdan keyin qayta urinib ko'ring.",
+                reply_markup=KEYBOARD)
+        return
+    matn, ok = add_alert(user_id, chat_id, x, banks)
+    if ok:
+        record_stat(user_id, "alert")
+    tg_send(chat_id, matn, reply_markup=KEYBOARD)
+
+
 def handle_private_message(msg):
-    """Shaxsiy chatdagi xabarlar: /start, tugmalar va summa kiritish. Hamma foydalanuvchi uchun."""
+    """Shaxsiy chatdagi xabarlar: /start, tugmalar, summa va xabarnoma kiritish. Hamma uchun."""
     if msg.get("chat", {}).get("type") != "private":
         return
     chat_id = msg["chat"]["id"]
     user_id = msg.get("from", {}).get("id", chat_id)
     text = (msg.get("text") or "").strip()
 
+    if re.match(r"/(statistika|stats?|statistics)\b", text):
+        if OWNER_ID and str(user_id) == str(OWNER_ID):      # faqat egasiga ko'rsatiladi
+            tg_send(chat_id, stats_text(), reply_markup=KEYBOARD)
+        return
+
     if text.startswith("/start") or text.startswith("/help"):
         USER_STATE.pop(user_id, None)
+        record_stat(user_id, "start")
         tg_send(chat_id, welcome_text(msg.get("from", {}).get("first_name")), reply_markup=KEYBOARD)
         return
 
-    if text == BTN_USD:
-        USER_STATE[user_id] = "usd"
-        tg_send(chat_id, "💵 Necha dollar? Raqam yozing, masalan: <b>2</b> yoki <b>100</b>",
-                reply_markup=KEYBOARD)
+    tugmalar = {
+        BTN_USD: ("usd", "💵 Necha dollar? Raqam yozing, masalan: <b>2</b> yoki <b>100</b>"),
+        BTN_UZS: ("uzs", "💰 Necha so'm? Raqam yozing, masalan: <b>400000</b> yoki <b>400 ming</b>"),
+        BTN_RUB: ("rub", "🇷🇺 Necha rubl? Raqam yozing, masalan: <b>1000</b>"),
+        BTN_UZS_RUB: ("uzs_rub", "💰 Necha so'm? Raqam yozing, masalan: <b>400000</b> yoki <b>400 ming</b>"),
+    }
+    if text in tugmalar:
+        USER_STATE[user_id] = tugmalar[text][0]
+        tg_send(chat_id, tugmalar[text][1], reply_markup=KEYBOARD)
         return
 
-    if text == BTN_UZS:
-        USER_STATE[user_id] = "uzs"
-        tg_send(chat_id, "💰 Necha so'm? Raqam yozing, masalan: <b>400000</b> yoki <b>400 ming</b>",
-                reply_markup=KEYBOARD)
+    if text == BTN_ALERT:
+        USER_STATE[user_id] = "alert"
+        tg_send(chat_id, _alert_prompt(user_id), reply_markup=KEYBOARD)
+        return
+
+    if text == BTN_CHANNEL:
+        from urllib.parse import quote
+        ulashish = ("https://t.me/share/url?url=" + quote(CHANNEL_URL, safe="") +
+                    "&text=" + quote("Dollar kursi va quyma oltin narxlari 👇", safe=""))
+        tg_send(chat_id,
+                f"📢 Kanalimiz: <b>{CHANNEL_USERNAME}</b>\n"
+                "Kunlik dollar kurslari va quyma oltin narxlari shu yerda. Obuna bo'ling va do'stlaringizga ulashing 👇",
+                reply_markup={"inline_keyboard": [
+                    [{"text": "📢 Kanalga o'tish", "url": CHANNEL_URL}],
+                    [{"text": "📤 Do'stlarga ulashish", "url": ulashish}],
+                ]})
         return
 
     if text.startswith("/"):
         return
 
+    state = USER_STATE.get(user_id)
+    if state == "alert":
+        handle_alert_input(chat_id, user_id, text)
+        return
+
     amount = parse_amount(text)
-    kind = detect_kind(text) or USER_STATE.get(user_id)
+    explicit = detect_kind(text)
+    if explicit == "uzs" and state == "uzs_rub":
+        kind = "uzs_rub"
+    else:
+        kind = explicit or state
     if amount is None or kind is None:
         tg_send(chat_id, "Tugmalardan birini tanlang va raqam yozing 👇", reply_markup=KEYBOARD)
         return
     tg_send(chat_id, convert_reply(kind, amount), reply_markup=KEYBOARD)
+    record_stat(user_id, "conv", kind)
 
 
 # ============================================================
@@ -826,10 +1146,12 @@ def ensure_no_webhook():
         return False
 
 
-def run_listen():
+def run_listen(timeout=0):
+    """timeout=0: bir marta tekshiradi (GitHub). timeout=25: xabar kelguncha kutadi (server, darhol javob).
+    True — Telegram bilan aloqa yaxshi, False — xato."""
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN topilmadi.")
-        return
+        return False
 
     try:
         with open(OFFSET_FILE) as f:
@@ -841,17 +1163,17 @@ def run_listen():
         f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
         params={
             "offset": offset,
-            "timeout": 0,
+            "timeout": timeout,
             "allowed_updates": json.dumps(["message", "my_chat_member"]),
         },
-        timeout=20,
+        timeout=timeout + 20,
     )
     data = resp.json()
     if not data.get("ok"):
         print(f"❌ getUpdates xatosi: {data}")
         if data.get("error_code") == 409 and "webhook" in str(data.get("description", "")).lower():
             ensure_no_webhook()
-        return
+        return False
 
     updates = data.get("result", [])
     if updates:
@@ -889,6 +1211,7 @@ def run_listen():
 
     with open(OFFSET_FILE, "w") as f:
         f.write(str(offset))
+    return True
 
 
 # ============================================================
