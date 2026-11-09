@@ -4,7 +4,8 @@ Doimiy ishlaydigan server (Railway va h.k.) uchun bot.
 Nima qiladi:
   1) Har kuni 08:00, 13:00 va 19:00 (Toshkent vaqti) da kurslarni kanalga tashlaydi.
      Ma'lumotni 2 daqiqa OLDIN olib qo'yadi va aniq soatning 00-soniyasida yuboradi.
-  2) /start ga va kanalga admin qilib qo'shilganiga darhol javob beradi.
+  2) /start, tugmalar (dollar/rubl hisoblagich, xabarnoma), /statistika (faqat egasiga) va
+     kanalga admin qilib qo'shilganiga darhol javob beradi.
   3) Ishga tushganda egasiga server bank.uz, cbu.uz va Telegramga yetib bora olishini yozadi.
 
 Ishga tushirish:  python scheduler.py
@@ -22,6 +23,7 @@ import main as bot
 
 SLOTS = [8, 13, 19]          # post soatlari (Toshkent vaqti)
 PREFETCH_SECONDS = 120       # ma'lumotni post vaqtidan necha soniya oldin olishni boshlash
+REFRESH_SECONDS = 300        # kurslarni fonda necha soniyada bir yangilash
 MAX_RETRIES = 2              # post chiqmasa, necha marta qayta urinish (5 daqiqa oralig'ida)
 
 
@@ -68,10 +70,26 @@ def listener_loop():
     """/start va admin hodisalarini doimiy tinglaydi (har 3 soniyada)."""
     while True:
         try:
-            bot.run_listen()
+            ok = bot.run_listen(timeout=25)      # uzoq so'rov: xabar kelishi bilan darhol javob
         except Exception as e:
             log(f"⚠️ listen xatosi: {str(e)[:150]}")
-        time.sleep(3)
+            ok = False
+        if not ok:
+            time.sleep(3)
+
+
+def refresher_loop():
+    """Kurslarni fonda yangilab turadi (foydalanuvchi so'raganda darhol javob berish uchun)
+    va har yangilanishdan keyin xabarnomalarni tekshiradi."""
+    while True:
+        try:
+            if bot.refresh_rates_cache() and bot.has_alerts():
+                banks, yosh = bot.get_rates_for_converter("USD")
+                if banks and yosh <= 15:
+                    bot.check_alerts(banks)
+        except Exception as e:
+            log(f"⚠️ fon yangilash xatosi: {str(e)[:150]}")
+        time.sleep(REFRESH_SECONDS)
 
 
 def main():
@@ -81,6 +99,8 @@ def main():
             time.sleep(3600)
 
     threading.Thread(target=listener_loop, daemon=True).start()
+    bot.BACKGROUND_REFRESH = True            # foydalanuvchini kutdirmaydi: kesh fonda yangilanadi
+    threading.Thread(target=refresher_loop, daemon=True).start()
     self_check()
 
     if os.environ.get("POST_ON_START") == "1":
