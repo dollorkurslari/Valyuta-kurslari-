@@ -2,6 +2,8 @@ import os
 import re
 import sys
 import json
+import math
+import html as htmllib
 import time
 import datetime
 import requests
@@ -99,12 +101,12 @@ def tozalash(matn):
     return int(toza_son) if toza_son else 0
 
 
-def tg_send(chat_id, text, parse_mode="HTML"):
-    resp = requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data={"chat_id": chat_id, "text": text, "parse_mode": parse_mode,
-              "disable_web_page_preview": True},
-    )
+def tg_send(chat_id, text, parse_mode="HTML", reply_markup=None):
+    data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode,
+            "disable_web_page_preview": True}
+    if reply_markup is not None:
+        data["reply_markup"] = json.dumps(reply_markup)
+    resp = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data=data)
     if resp.status_code != 200:
         print(f"❌ Telegram xatosi ({chat_id}): {resp.text}")
     return resp
@@ -563,6 +565,7 @@ def run_send(target_hour=None, fetch_first=False):
         return False
 
     print(f"✅ {len(banks)} ta bank topildi.")
+    set_rates_cache(banks)
     if skipped:
         print(f"⚠️ O'tkazib yuborildi ({len(skipped)} ta): {', '.join(skipped)}")
 
@@ -619,7 +622,7 @@ def run_send(target_hour=None, fetch_first=False):
     if skipped:
         xabar += f"\n<i>⚠️ Ushbu banklar o'tkazib yuborildi: {', '.join(skipped)}</i>\n"
 
-    xabar += f"\n🕒 <b>Yangilandi:</b> @@VAQT@@\n📢 @dollorkurslariUZ"
+    xabar += f"\n🕒 <b>Yangilandi:</b> @@VAQT@@\n📢 @dollarkursiuzz"
 
     # server rejimi: ma'lumot oldindan olingan, endi aniq soniyagacha kutib yuboramiz
     if target_hour is not None and fetch_first:
@@ -641,9 +644,188 @@ def run_send(target_hour=None, fetch_first=False):
 
 
 # ============================================================
+# BOT: /start, tugmalar va hisoblagich (dollar <-> so'm)
+# ============================================================
+CHANNEL_USERNAME = "@dollarkursiuzz"
+BTN_USD = "💵 Dollar → So'm"
+BTN_UZS = "💰 So'm → Dollar"
+KEYBOARD = {
+    "keyboard": [[{"text": BTN_USD}, {"text": BTN_UZS}]],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
+
+USER_STATE = {}                          # foydalanuvchi qaysi tugmani bosgani (xotirada)
+RATES_CACHE = {"ts": 0.0, "banks": None}
+RATES_CACHE_TTL = 600                    # kurslarni 10 daqiqa eslab turamiz
+
+
+def set_rates_cache(banks):
+    RATES_CACHE["ts"] = time.time()
+    RATES_CACHE["banks"] = banks
+
+
+def get_rates_for_converter():
+    """(banklar, necha_daqiqa_oldin) qaytaradi. Yangi bo'lmasa bank.uz dan qayta oladi.
+    Hech narsa olib bo'lmasa (None, None)."""
+    now = time.time()
+    if RATES_CACHE["banks"] and now - RATES_CACHE["ts"] < RATES_CACHE_TTL:
+        return RATES_CACHE["banks"], int((now - RATES_CACHE["ts"]) // 60)
+    try:
+        banks, _ = get_all_bank_rates()
+        if len(banks) >= 5:
+            set_rates_cache(banks)
+            return banks, 0
+    except Exception as e:
+        print(f"⚠️ Hisoblagich uchun kurs olib bo'lmadi: {str(e)[:150]}")
+    if RATES_CACHE["banks"]:
+        return RATES_CACHE["banks"], int((now - RATES_CACHE["ts"]) // 60)
+    return None, None
+
+
+def detect_kind(text):
+    """Matndan nima hisoblash kerakligini aniqlaydi: 'usd' ($ -> so'm) yoki 'uzs' (so'm -> $)."""
+    t = text.lower()
+    if "$" in t or re.search(r"dollar|dollor|usd", t):
+        return "usd"
+    if re.search(r"so['‘’`]?m|\bsum\b|ming|\bmin\b|mln|million|milyon|uzs", t):
+        return "uzs"
+    return None
+
+
+def parse_amount(text):
+    """'2', '2.5', '100$', '400000', '400 000', '400 ming', '1.5 mln' -> float yoki None."""
+    t = text.lower().replace("\u00a0", " ")
+    if re.match(r"\s*-", t):
+        return None                          # manfiy son qabul qilinmaydi
+    mult = 1
+    if re.search(r"mln|million|milyon", t):
+        mult = 1_000_000
+    elif re.search(r"ming|\bmin\b|\d\s*k\b", t):
+        mult = 1000
+    m = re.search(r"\d[\d ]*(?:[.,]\d+)*", t)
+    if not m:
+        return None
+    sraw = m.group(0).strip().replace(" ", "")
+    if re.fullmatch(r"\d{1,3}([,.]\d{3}){2,}", sraw):
+        sraw = re.sub(r"[,.]", "", sraw)    # 1,500,000 yoki 1.500.000
+    elif re.fullmatch(r"\d{1,3},\d{3}", sraw) and mult == 1:
+        sraw = sraw.replace(",", "")        # 1,500
+    else:
+        sraw = sraw.replace(",", ".")       # 2,5
+    try:
+        v = float(sraw) * mult
+    except ValueError:
+        return None
+    return v if 0 < v <= 1_000_000_000 else None
+
+
+def _fmt(n):
+    return f"{int(n):,}".replace(",", " ")
+
+
+def _fmt_amount(v):
+    return _fmt(v) if float(v).is_integer() else f"{v:.2f}".rstrip("0").rstrip(".")
+
+
+def convert_reply(kind, amount):
+    """Hisoblash natijasi matni (HTML). Dollar -> so'm: eng YUQORI xarid kursi.
+    So'm -> dollar: eng PAST sotuv kursi."""
+    banks, yosh = get_rates_for_converter()
+    if not banks:
+        return "😔 Hozir bank kurslarini ola olmadim. Birozdan keyin qayta urinib ko'ring."
+
+    yangilik = "🕒 Kurslar hozirgina olindi" if yosh == 0 else f"🕒 Kurslar {yosh} daqiqa oldin olingan"
+
+    if kind == "usd":
+        b = max(banks, key=lambda r: r["buy_num"])
+        jami = round(amount * b["buy_num"])
+        return (f"💵 <b>{_fmt_amount(amount)} dollar</b> = <b>{_fmt(jami)} so'm</b>\n\n"
+                f"🏦 Bank: <b>{htmllib.escape(b['name'])}</b> (eng yuqori xarid kursi)\n"
+                f"📈 Kurs: 1 dollar = {_fmt(b['buy_num'])} so'm\n\n"
+                f"<i>Bank dollaringizni shu kurs bo'yicha sotib oladi.</i>\n{yangilik}")
+
+    b = min(banks, key=lambda r: r["sell_num"])
+    dollar = math.floor(amount / b["sell_num"] * 100) / 100
+    return (f"💰 <b>{_fmt_amount(amount)} so'm</b> = <b>{dollar:.2f} dollar</b>\n\n"
+            f"🏦 Bank: <b>{htmllib.escape(b['name'])}</b> (eng arzon sotuv kursi)\n"
+            f"📉 Kurs: 1 dollar = {_fmt(b['sell_num'])} so'm\n\n"
+            f"<i>Bank sizga dollarni shu kurs bo'yicha sotadi.</i>\n{yangilik}")
+
+
+def welcome_text(first_name):
+    ism = htmllib.escape(first_name or "do'stim")
+    return (f"👋 Assalomu alaykum, <b>{ism}</b>!\n\n"
+            "Men O'zbekiston banklaridagi dollar kurslarini kuzatib boradigan botman.\n\n"
+            "<b>Nimalar qila olaman:</b>\n"
+            "💵 <b>Dollar → So'm</b>: dollaringizni so'mga hisoblab beraman va "
+            "eng yuqori narx beradigan bankni ko'rsataman\n"
+            "💰 <b>So'm → Dollar</b>: so'mingizga necha dollar olishingizni hisoblab beraman va "
+            "eng arzon sotadigan bankni ko'rsataman\n\n"
+            f"📢 {CHANNEL_USERNAME} kanalida kunlik dollar kurslari va quyma oltin narxlari "
+            "har kuni yangilanib turadi.\n\n"
+            "Quyidagi tugmalardan birini tanlang 👇")
+
+
+def handle_private_message(msg):
+    """Shaxsiy chatdagi xabarlar: /start, tugmalar va summa kiritish. Hamma foydalanuvchi uchun."""
+    if msg.get("chat", {}).get("type") != "private":
+        return
+    chat_id = msg["chat"]["id"]
+    user_id = msg.get("from", {}).get("id", chat_id)
+    text = (msg.get("text") or "").strip()
+
+    if text.startswith("/start") or text.startswith("/help"):
+        USER_STATE.pop(user_id, None)
+        tg_send(chat_id, welcome_text(msg.get("from", {}).get("first_name")), reply_markup=KEYBOARD)
+        return
+
+    if text == BTN_USD:
+        USER_STATE[user_id] = "usd"
+        tg_send(chat_id, "💵 Necha dollar? Raqam yozing, masalan: <b>2</b> yoki <b>100</b>",
+                reply_markup=KEYBOARD)
+        return
+
+    if text == BTN_UZS:
+        USER_STATE[user_id] = "uzs"
+        tg_send(chat_id, "💰 Necha so'm? Raqam yozing, masalan: <b>400000</b> yoki <b>400 ming</b>",
+                reply_markup=KEYBOARD)
+        return
+
+    if text.startswith("/"):
+        return
+
+    amount = parse_amount(text)
+    kind = detect_kind(text) or USER_STATE.get(user_id)
+    if amount is None or kind is None:
+        tg_send(chat_id, "Tugmalardan birini tanlang va raqam yozing 👇", reply_markup=KEYBOARD)
+        return
+    tg_send(chat_id, convert_reply(kind, amount), reply_markup=KEYBOARD)
+
+
+# ============================================================
 # REJIM 2: "listen" — /start va kanalga admin qilib qo'shilganini tinglash
 # (GitHub Actions'da har 2-3 daqiqada chaqiriladi)
 # ============================================================
+def ensure_no_webhook():
+    """Botda webhook yoqilgan bo'lsa, getUpdates ishlamaydi (409 xatosi).
+    Webhook bor bo'lsa, uni o'chiradi. True qaytarsa — webhook o'chirildi."""
+    try:
+        info = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo", timeout=20).json()
+        url = (info.get("result") or {}).get("url") or ""
+        if not url:
+            print("ℹ️ Webhook yo'q.")
+            return False
+        host = re.sub(r"^https?://", "", url).split("/")[0]
+        print(f"🧹 Botda webhook topildi ({host}) — o'chirilmoqda...")
+        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=20)
+        print(f"🧹 deleteWebhook javobi: {r.text[:120]}")
+        return bool(r.json().get("ok"))
+    except Exception as e:
+        print(f"⚠️ Webhook'ni tekshirib bo'lmadi: {str(e)[:120]}")
+        return False
+
+
 def run_listen():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN topilmadi.")
@@ -667,6 +849,8 @@ def run_listen():
     data = resp.json()
     if not data.get("ok"):
         print(f"❌ getUpdates xatosi: {data}")
+        if data.get("error_code") == 409 and "webhook" in str(data.get("description", "")).lower():
+            ensure_no_webhook()
         return
 
     updates = data.get("result", [])
@@ -676,25 +860,13 @@ def run_listen():
     for u in updates:
         offset = u["update_id"] + 1
 
-        # /start bosilganda — FAQAT egasi (OWNER_ID) uchun javob beradi
+        # shaxsiy chatdagi xabarlar (/start, tugmalar, summa) — hamma foydalanuvchi uchun
         msg = u.get("message")
-        if msg and msg.get("text", "").startswith("/start"):
-            user_id = str(msg["from"]["id"])
-            chat_id = msg["chat"]["id"]
-
-            if OWNER_ID and user_id != str(OWNER_ID):
-                print(f"⛔ Begona foydalanuvchi /start bosdi (id={user_id}) — e'tiborsiz qoldirildi.")
-                continue
-
-            matn = (
-                "👋 Salom!\n\n"
-                "Men O'zbekiston banklaridagi dollar kurslari va quyma oltin "
-                "narxlarini kuzataman.\n\n"
-                "📌 Meni kanalingizga <b>admin</b> qilib qo'shing — har kuni soat "
-                "08:00, 13:00 va 19:00 da yangilangan narxlarni avtomatik yuborib turaman."
-            )
-            tg_send(chat_id, matn)
-            print(f"✅ /start javobi yuborildi: {chat_id}")
+        if msg and msg.get("text") and msg.get("chat", {}).get("type") == "private":
+            try:
+                handle_private_message(msg)
+            except Exception as e:
+                print(f"⚠️ Xabarni qayta ishlashda xato: {str(e)[:150]}")
 
         # kanalga admin qilib qo'shilganda — FAQAT egasi qo'shgan bo'lsa xabar beradi
         cm = u.get("my_chat_member")
