@@ -29,10 +29,31 @@ if hasattr(time, 'tzset'):
 # BOT_TOKEN = botfather tokeni
 # CHAT_ID   = kanal ID (masalan @dollorkurslariUZ yoki -100...)
 # ============================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-OWNER_ID = os.environ.get("OWNER_ID")  # faqat shu Telegram ID'ga ega odamga bot javob beradi
-CALLME_USER = os.environ.get("CALLME_USER")  # Telegram @username (yoki +998...) — jiddiy xatoda shu orqali qo'ng'iroq qilinadi
+def _env(nom):
+    """Muhit o'zgaruvchisini o'qiydi; boshi-oxiridagi bo'shliq, yangi qator va qo'shtirnoqlarni olib tashlaydi
+    (Railway/GitHub'ga nusxalashda tasodifan qo'shilib qolishi mumkin)."""
+    v = os.environ.get(nom)
+    if v is None:
+        return None
+    v = v.strip().strip('"').strip("'").strip()
+    return v or None
+
+
+def _callme_user(v):
+    """CallMeBot uchun username/telefonni tozalaydi: '@uzbrel ' yoki '@uzbrel+' -> '@uzbrel'."""
+    if not v:
+        return None
+    v = v.strip()
+    if re.fullmatch(r"\+?\d{9,15}", v):
+        return v if v.startswith("+") else "+" + v            # telefon raqami
+    v = re.sub(r"[^A-Za-z0-9_]+$", "", v.lstrip("@").strip())  # username oxiridagi ortiqcha belgilar
+    return ("@" + v) if v else None
+
+
+BOT_TOKEN = _env("BOT_TOKEN")
+CHAT_ID = _env("CHAT_ID")
+OWNER_ID = _env("OWNER_ID")  # faqat shu Telegram ID'ga ega odamga bot javob beradi
+CALLME_USER = _callme_user(_env("CALLME_USER"))  # Telegram @username (yoki +998...) — jiddiy xatoda shu orqali qo'ng'iroq qilinadi
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
