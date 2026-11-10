@@ -424,19 +424,22 @@ LAST_RATES_FILE = "last_rates.json"
 def call_owner(text="Внимание! Бот курсов валют не отправил пост. Проверьте Телеграм."):
     """Egasiga TELEGRAM orqali ovozli qo'ng'iroq qiladi (CallMeBot bepul xizmati orqali).
     Oddiy telefon (GSM) qo'ng'irog'i emas: qo'ng'iroq Telegram ilovasida jiringlaydi.
-    CALLME_USER berilmagan bo'lsa, hech narsa qilmaydi."""
+    CALLME_USER berilmagan bo'lsa None qaytaradi. Aks holda xizmat javobini matn qilib qaytaradi."""
     if not CALLME_USER:
         print("ℹ️ CALLME_USER yo'q, qo'ng'iroq qilinmadi.")
-        return
+        return None
     try:
         r = requests.get(
-            "http://api.callmebot.com/start.php",
+            "https://api.callmebot.com/start.php",
             params={"user": CALLME_USER, "text": text, "lang": "ru-RU-Standard-A", "rpt": 2},
             timeout=30,
         )
-        print(f"📞 Qo'ng'iroq so'rovi yuborildi (status {r.status_code}).")
+        natija = f"status {r.status_code}: {r.text[:150].strip()}"
+        print(f"📞 Qo'ng'iroq so'rovi yuborildi ({natija})")
+        return natija
     except Exception as e:
         print(f"⚠️ Qo'ng'iroq qilib bo'lmadi: {str(e)[:120]}")
+        return f"xato: {str(e)[:100]}"
 
 
 def notify_owner(text, call=False):
@@ -1064,6 +1067,16 @@ def handle_private_message(msg):
 
     if re.match(r"/id\b", text):
         tg_send(chat_id, f"Sizning Telegram ID'ingiz: <code>{user_id}</code>")
+        return
+
+    if re.match(r"/(qongiroq|call)\b", text):
+        if OWNER_ID and str(user_id) == str(OWNER_ID):
+            if not CALLME_USER:
+                tg_send(chat_id, "⚠️ CALLME_USER sozlanmagan. Railway → Variables ga CALLME_USER (@username) qo'shing.")
+            else:
+                natija = call_owner("Проверка связи. Бот курсов валют работает.")
+                tg_send(chat_id, "📞 Qo'ng'iroq so'rovi yuborildi. Telegramda qo'ng'iroq kelishi kerak.\n"
+                                 f"Xizmat javobi: <code>{htmllib.escape(str(natija))}</code>")
         return
 
     if re.match(r"/(statistika|stats?|statistics)\b", text):
