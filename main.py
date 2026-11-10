@@ -434,7 +434,11 @@ def call_owner(text="Внимание! Бот курсов валют не от�
             params={"user": CALLME_USER, "text": text, "lang": "ru-RU-Standard-A", "rpt": 2},
             timeout=30,
         )
-        natija = f"status {r.status_code}: {r.text[:150].strip()}"
+        ko_rinadigan = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", r.text)   # HTML javobdan faqat matnni olamiz
+        ko_rinadigan = re.sub(r"(?s)<!--.*?-->", " ", ko_rinadigan)
+        ko_rinadigan = re.sub(r"<[^>]+>", " ", ko_rinadigan)
+        ko_rinadigan = re.sub(r"\s+", " ", ko_rinadigan).strip()
+        natija = f"status {r.status_code}: {ko_rinadigan[:300] or '(matn yo`q)'}"
         print(f"📞 Qo'ng'iroq so'rovi yuborildi ({natija})")
         return natija
     except Exception as e:
