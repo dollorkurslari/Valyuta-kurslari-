@@ -708,7 +708,7 @@ def run_send(target_hour=None, fetch_first=False):
     if skipped:
         xabar += f"\n<i>⚠️ Ushbu banklar o'tkazib yuborildi: {', '.join(skipped)}</i>\n"
 
-    xabar += f"\n🕒 <b>Yangilandi:</b> @@VAQT@@\n📢 @dollorkurslariUZ"
+    xabar += f"\n🕒 <b>Yangilandi:</b> @@VAQT@@\n📢 @dollarkursiuzz"
 
     # server rejimi: ma'lumot oldindan olingan, endi aniq soniyagacha kutib yuboramiz
     if target_hour is not None and fetch_first:
