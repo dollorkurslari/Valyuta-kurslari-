@@ -54,6 +54,7 @@ BOT_TOKEN = _env("BOT_TOKEN")
 CHAT_ID = _env("CHAT_ID")
 OWNER_ID = _env("OWNER_ID")  # faqat shu Telegram ID'ga ega odamga bot javob beradi
 CALLME_USER = _callme_user(_env("CALLME_USER"))  # Telegram @username (yoki +998...) — jiddiy xatoda shu orqali qo'ng'iroq qilinadi
+NTFY_TOPIC = re.sub(r"[^A-Za-z0-9_-]", "", _env("NTFY_TOPIC") or "") or None  # ntfy.sh mavzusi (zaxira shoshilinch ogohlantirish)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -477,6 +478,33 @@ def call_owner(text="Внимание! Бот курсов валют не от�
         return f"xato: {str(e)[:100]}"
 
 
+_LAST_NTFY = {"t": 0.0}
+
+
+def ntfy_owner(min_gap=600):
+    """Telefonga SHOSHILINCH push-xabar yuboradi (ntfy.sh, bepul). Telegram qo'ng'irog'i ishlamay turganda zaxira.
+    Matn qasddan qisqa va maxfiy ma'lumotsiz. NTFY_TOPIC yo'q bo'lsa None qaytaradi."""
+    if not NTFY_TOPIC:
+        return None
+    otdi = time.time() - _LAST_NTFY["t"]
+    if otdi < min_gap:
+        return f"o'tkazib yuborildi: oxirgisidan {int(otdi)} soniya o'tdi (kamida {min_gap} soniya kerak)"
+    _LAST_NTFY["t"] = time.time()
+    try:
+        r = requests.post(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data="Kurs boti: jiddiy xato! Telegramni tekshiring.".encode("utf-8"),
+            headers={"Title": "Kurs boti", "Priority": "urgent", "Tags": "rotating_light"},
+            timeout=20,
+        )
+        natija = f"status {r.status_code}"
+        print(f"📲 ntfy ogohlantirishi yuborildi ({natija})")
+        return natija
+    except Exception as e:
+        print(f"⚠️ ntfy yuborib bo'lmadi: {str(e)[:100]}")
+        return f"xato: {str(e)[:100]}"
+
+
 def notify_owner(text, call=False):
     """Xatolik bo'lsa egasiga (OWNER_ID) shaxsiy xabar yuboradi.
     call=True bo'lsa (faqat jiddiy xatolarda), qo'shimcha ravishda Telegram orqali qo'ng'iroq ham qiladi.
@@ -490,6 +518,7 @@ def notify_owner(text, call=False):
         print("ℹ️ OWNER_ID yo'q, egasiga xabar yuborilmadi.")
     if call:
         call_owner()
+        ntfy_owner()
 
 
 def load_last_rates():
@@ -1106,12 +1135,18 @@ def handle_private_message(msg):
 
     if re.match(r"/(qongiroq|call)\b", text):
         if OWNER_ID and str(user_id) == str(OWNER_ID):
-            if not CALLME_USER:
-                tg_send(chat_id, "⚠️ CALLME_USER sozlanmagan. Railway → Variables ga CALLME_USER (@username) qo'shing.")
-            else:
+            qatorlar = []
+            if CALLME_USER:
                 natija = call_owner("Проверка связи. Бот курсов валют работает.", min_gap=300)
-                tg_send(chat_id, "📞 Qo'ng'iroq so'rovi yuborildi. Telegramda qo'ng'iroq kelishi kerak.\n"
-                                 f"Xizmat javobi: <code>{htmllib.escape(str(natija))}</code>")
+                qatorlar.append(f"📞 Telegram qo'ng'irog'i: <code>{htmllib.escape(str(natija))}</code>")
+            else:
+                qatorlar.append("📞 Telegram qo'ng'irog'i: CALLME_USER sozlanmagan")
+            if NTFY_TOPIC:
+                natija = ntfy_owner(min_gap=60)
+                qatorlar.append(f"📲 Shoshilinch push (ntfy): <code>{htmllib.escape(str(natija))}</code>")
+            else:
+                qatorlar.append("📲 Shoshilinch push (ntfy): NTFY_TOPIC sozlanmagan")
+            tg_send(chat_id, "\n".join(qatorlar))
         return
 
     if re.match(r"/(statistika|stats?|statistics)\b", text):
