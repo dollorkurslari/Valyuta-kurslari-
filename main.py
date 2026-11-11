@@ -442,13 +442,23 @@ def get_gold_prices(driver_path=None):
 LAST_RATES_FILE = "last_rates.json"
 
 
-def call_owner(text="Внимание! Бот курсов валют не отправил пост. Проверьте Телеграм."):
+_LAST_CALL = {"t": 0.0}
+
+
+def call_owner(text="Внимание! Бот курсов валют не отправил пост. Проверьте Телеграм.", min_gap=1800):
     """Egasiga TELEGRAM orqali ovozli qo'ng'iroq qiladi (CallMeBot bepul xizmati orqali).
     Oddiy telefon (GSM) qo'ng'irog'i emas: qo'ng'iroq Telegram ilovasida jiringlaydi.
     CALLME_USER berilmagan bo'lsa None qaytaradi. Aks holda xizmat javobini matn qilib qaytaradi."""
     if not CALLME_USER:
         print("ℹ️ CALLME_USER yo'q, qo'ng'iroq qilinmadi.")
         return None
+    # Telegram qisqa vaqtda ko'p qo'ng'iroqni "FLOOD" deb bloklaydi — shuning uchun oraliq qo'yamiz
+    otdi = time.time() - _LAST_CALL["t"]
+    if otdi < min_gap:
+        natija = f"o'tkazib yuborildi: oxirgi qo'ng'iroqdan {int(otdi)} soniya o'tdi (kamida {min_gap} soniya kerak)"
+        print(f"⏭ Qo'ng'iroq {natija}")
+        return natija
+    _LAST_CALL["t"] = time.time()
     try:
         r = requests.get(
             "https://api.callmebot.com/start.php",
@@ -1099,7 +1109,7 @@ def handle_private_message(msg):
             if not CALLME_USER:
                 tg_send(chat_id, "⚠️ CALLME_USER sozlanmagan. Railway → Variables ga CALLME_USER (@username) qo'shing.")
             else:
-                natija = call_owner("Проверка связи. Бот курсов валют работает.")
+                natija = call_owner("Проверка связи. Бот курсов валют работает.", min_gap=300)
                 tg_send(chat_id, "📞 Qo'ng'iroq so'rovi yuborildi. Telegramda qo'ng'iroq kelishi kerak.\n"
                                  f"Xizmat javobi: <code>{htmllib.escape(str(natija))}</code>")
         return
